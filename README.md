@@ -1,4 +1,4 @@
-# v4 Parallel Orchestrator: run_research.py
+Intern-Research-Agent
 
 Generate private equity firm dossiers by orchestrating eight discrete research skills in a six-stage pipeline, with bounded concurrency and isolated error handling per company.
 
