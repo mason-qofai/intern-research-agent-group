@@ -16,7 +16,7 @@ Generate private equity firm dossiers by orchestrating eight discrete research s
    - `dossier-assembler/SKILL.md`
    - `audit-pass/SKILL.md`
 
-4. (Optional) Populate `sources/` with local research documents (.md, .txt, .html). These are used by firm-profiler, portfolio-discoverer, and portco-profiler. If empty, those skills will fail.
+4. Populate `sources/` with local research documents (.md, .txt, .html). These are used by firm-profiler, portfolio-discoverer, and portco-profiler. If empty, those skills will fail.
 
 ## Usage
 
