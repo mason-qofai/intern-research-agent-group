@@ -22,9 +22,7 @@ description: Used once per portfolio company to write the overview of each speci
 | hq_location | string |
 | employee_count_estimate | string (range) |
 | sector | string |
-| leadership | list[{name, title}] |
 | notable_events | list[{date, event}] |
-| ownership_stake | string, nullable |
 | citations | list[{claim_id, url}] |
 
 Every field above carries `confidence` (high/medium/low) and `source_type` (public document/public inference; no private inference category, the target fact being private doesn't change the classification). This output is the required input to private-data-approximator.
