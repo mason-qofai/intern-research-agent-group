@@ -76,6 +76,39 @@ class SkillCallError(Exception):
     the event loop has finished."""
 
 
+class RunBudgetExceededError(SkillCallError):
+    """Raised when cumulative run spend crosses --max-run-budget-usd.
+    Subclasses SkillCallError so main()'s existing except SkillCallError
+    handler exits cleanly with no code change there. Must NOT be caught by
+    profile_company/estimate_financials's per-company retry loops -- it's
+    not a transient per-call failure, so retrying after the run budget is
+    already blown would only spend more."""
+
+
+class BudgetTracker:
+    """Tracks cumulative spend across every call_skill invocation in a run
+    and raises once a run-level cap is crossed. This is cheap insurance,
+    not a hard real-time meter: the check happens once per call, right
+    before that call's subprocess is spawned, so calls already in flight
+    when the cap is crossed are left to finish rather than being killed --
+    actual spend can overshoot the cap by up to max_concurrency in-flight
+    calls' worth."""
+
+    def __init__(self, cap_usd):
+        self.cap_usd = cap_usd
+        self.spent_usd = 0.0
+
+    def check(self):
+        if self.cap_usd is not None and self.spent_usd >= self.cap_usd:
+            raise RunBudgetExceededError(
+                f"run budget exceeded: spent ${self.spent_usd:.2f} of "
+                f"${self.cap_usd:.2f} cap, stopping before starting a new skill call"
+            )
+
+    def add(self, cost_usd):
+        self.spent_usd += cost_usd
+
+
 def read_skill_md(skill_name):
     path = SKILLS_DIR / skill_name / "SKILL.md"
     if not path.exists():
@@ -99,29 +132,63 @@ def list_source_files():
     )
 
 
+def _normalize_words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _acronym(text):
+    return "".join(w[0] for w in re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def list_source_files_for_company(company_name):
+    """Filters list_source_files() down to files whose name plausibly
+    relates to company_name, instead of handing every file in sources/ to
+    every portco-profiler call. portco-profiler runs once per portfolio
+    company, so without this filter a firm with N portfolio companies
+    re-reads the entire sources/ directory N times (plus once per retry),
+    almost all of it irrelevant to any single company. Matches on shared
+    words, or on the company's acronym appearing as a whole word in the
+    filename (e.g. "Superior Environmental Solutions" -> "ses", matching
+    "SES_Chemworx_addon.md") since add-on/acquisition docs are often named
+    by acronym rather than full company name. Returns [] if nothing
+    matches; callers should fall back to the full listing rather than
+    starving the skill of source material over a naming mismatch."""
+    company_words = _normalize_words(company_name)
+    company_acronym = _acronym(company_name)
+    matches = []
+    for f in list_source_files():
+        stem_words = _normalize_words(f.stem)
+        if company_words & stem_words:
+            matches.append(f)
+        elif len(company_acronym) >= 3 and company_acronym in stem_words:
+            matches.append(f)
+    return matches
+
+
 def extract_trailing_json_block(text):
     """
     Pulls the JSON content out of a '## Claims' fenced block at the end of
     a markdown + hybrid-format output. Returns (markdown_body, claims_list).
-    If no '## Claims' heading is found, falls back to the last fenced
-    ```json block in the text. Raises if neither is found, since every
-    skill in SOURCE_BASED_SKILLS | WEB_SEARCH_SKILLS is contractually
-    required to end in one.
+
+    Always takes the LAST ```json fenced block in the text as the claims
+    payload (matches the contract that every skill in SOURCE_BASED_SKILLS |
+    WEB_SEARCH_SKILLS must end in one). A '## Claims' heading, if present
+    before that fence, marks where markdown_body ends. This also tolerates
+    a heading that lands as the first line *inside* the fence instead of
+    before it (a formatting slip some models produce, e.g. opening the
+    fence before "## Claims" rather than after) by stripping it before
+    parsing. Raises if no fenced json block is found at all.
     """
-    claims_heading_match = re.search(r"##\s*Claims\s*\n", text)
+    fence_matches = list(re.finditer(r"```json\s*(.*?)```", text, re.DOTALL))
+    if not fence_matches:
+        raise ValueError("no fenced json block found in output at all")
+    last = fence_matches[-1]
+    json_text = re.sub(r"^\s*##\s*Claims\s*\n", "", last.group(1))
+
+    claims_heading_match = re.search(r"##\s*Claims\s*\n", text[:last.start()])
     if claims_heading_match:
-        after_heading = text[claims_heading_match.end():]
-        fence_match = re.search(r"```json\s*(.*?)```", after_heading, re.DOTALL)
-        if not fence_match:
-            raise ValueError("found '## Claims' heading but no fenced json block after it")
-        json_text = fence_match.group(1)
         markdown_body = text[:claims_heading_match.start()].strip()
     else:
-        fence_matches = list(re.finditer(r"```json\s*(.*?)```", text, re.DOTALL))
-        if not fence_matches:
-            raise ValueError("no '## Claims' heading and no fenced json block found at all")
-        last = fence_matches[-1]
-        json_text = last.group(1)
         markdown_body = text[:last.start()].strip()
 
     try:
@@ -180,23 +247,54 @@ def append_log(run_dir, message):
 
 
 async def call_skill(skill_name, input_payload, model, max_budget_usd, timeout, run_dir,
-                      semaphore, invocation_label=None):
+                      semaphore, budget_tracker, invocation_label=None, reduced=False):
     """Async version of the v3 call_skill. Acquires `semaphore` for the
     full duration of the subprocess call, so concurrent fan-out (stage 2
     and stage 3) is bounded rather than launching every company at once
-    against a live API budget and rate limit."""
+    against a live API budget and rate limit.
+
+    `reduced` marks a retry attempt: portco-profiler gets only its single
+    best-matching source file instead of every match, and web-search
+    skills get an extra instruction to settle for the first usable finding
+    instead of comparing options. A failed first attempt shouldn't cost as
+    much as the first one did."""
     skill_md = read_skill_md(skill_name)
 
     extra = ""
     if skill_name in SOURCE_BASED_SKILLS:
-        source_files = list_source_files()
+        if skill_name == "portco-profiler":
+            company_name = input_payload.get("company_name", "")
+            source_files = list_source_files_for_company(company_name)
+            if not source_files:
+                append_log(
+                    run_dir,
+                    f"no sources/ filename matched company_name={company_name!r}, "
+                    f"falling back to the full sources/ listing for this portco-profiler call"
+                )
+                source_files = list_source_files()
+            if reduced and source_files:
+                source_files = source_files[:1]
+        else:
+            source_files = list_source_files()
         if not source_files:
             raise SkillCallError(f"no source files found in {SOURCES_DIR}, required for {skill_name}")
-        listing = "\n".join(f"- sources/{f.name}" for f in source_files)
+        # Content is embedded directly rather than handed to the model as a
+        # filename list to Read one-by-one. Reading N files via sequential
+        # Read tool calls inside one turn-based conversation resends the
+        # entire growing conversation history (every file already read, plus
+        # SKILL.md, plus tool overhead) as input again on every subsequent
+        # turn -- a cost that scales worse than linearly in file count and
+        # was measured burning ~300k tokens on firm-profiler +
+        # portfolio-discoverer alone, before any web search ever ran.
+        # Embedding puts everything in the prompt in one shot, no tool
+        # round-trips required.
+        blocks = [f"### sources/{f.name}\n\n{f.read_text()}" for f in source_files]
         extra = (
-            "All sources for this call are local files in sources/, listed below. "
-            "Use the Read tool to open each one. Nothing is fetched from the web "
-            "for this skill.\n\n=== SOURCE FILES ===\n\n" + listing
+            "All sources for this call are embedded in full below. Nothing is "
+            "fetched from the web for this skill, and there is no need to Read "
+            "any files -- the complete content of every relevant source is "
+            "already here.\n\n=== SOURCE FILES (full content) ===\n\n"
+            + "\n\n---\n\n".join(blocks)
         )
         allowed_tools = "Read"
     elif skill_name in WEB_SEARCH_SKILLS:
@@ -205,6 +303,12 @@ async def call_skill(skill_name, input_payload, model, max_budget_usd, timeout, 
             "own SKILL.md (SEC/EDGAR preferred, tier 2 sources only when fully "
             "readable, never paraphrase from a paywalled snippet)."
         )
+        if reduced:
+            extra += (
+                " This is a retry attempt -- settle for the very first usable "
+                "comp that satisfies the tier rules above; do not compare "
+                "multiple candidates before choosing."
+            )
         allowed_tools = "Read,WebSearch,WebFetch"
     else:
         allowed_tools = "Read"
@@ -214,7 +318,7 @@ async def call_skill(skill_name, input_payload, model, max_budget_usd, timeout, 
     cmd = [
         "claude", "-p", prompt,
         "--allowedTools", allowed_tools,
-        "--output-format", "text",
+        "--output-format", "json",
         "--max-budget-usd", str(max_budget_usd),
     ]
     if model:
@@ -223,6 +327,7 @@ async def call_skill(skill_name, input_payload, model, max_budget_usd, timeout, 
     label = invocation_label or skill_name
 
     async with semaphore:
+        budget_tracker.check()
         print(f"[run_research] calling {label} ...", file=sys.stderr)
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -246,9 +351,27 @@ async def call_skill(skill_name, input_payload, model, max_budget_usd, timeout, 
                 f"{label} exited with status {proc.returncode}\n{stderr.decode(errors='replace')}"
             )
 
-        raw = stdout.decode(errors="replace").strip()
-        if not raw:
+        stdout_text = stdout.decode(errors="replace").strip()
+        if not stdout_text:
             raise SkillCallError(f"{label} produced no output\n{stderr.decode(errors='replace')}")
+
+        try:
+            envelope = json.loads(stdout_text)
+        except json.JSONDecodeError as e:
+            raise SkillCallError(f"{label} did not return valid --output-format json: {e}\nraw:\n{stdout_text}")
+
+        cost_usd = envelope.get("total_cost_usd") or 0.0
+        budget_tracker.add(cost_usd)
+
+        if envelope.get("is_error"):
+            raise SkillCallError(
+                f"{label} returned an error (subtype={envelope.get('subtype')}): "
+                f"{envelope.get('errors')}"
+            )
+
+        raw = (envelope.get("result") or "").strip()
+        if not raw:
+            raise SkillCallError(f"{label} produced no result text in its json output")
 
         save_raw_output(run_dir, label, raw)
         return raw
@@ -318,12 +441,16 @@ def extract_company_name(claim):
     return name
 
 
-async def profile_company(company_name, firm_name, model, max_budget_usd, timeout, run_dir, semaphore):
+async def profile_company(company_name, firm_name, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker):
     """Stage 2 subagent: portco-profiler for one company, up to
     MAX_ATTEMPTS_PER_COMPANY tries. Returns (company_name, markdown, claims)
     on success, or (company_name, None, None) on exhausted retries. Never
-    raises, so one company's failure can't take down asyncio.gather for
-    the rest of the fan-out."""
+    raises (except RunBudgetExceededError, which is not a per-company
+    failure and must propagate rather than being retried or swallowed), so
+    one company's failure can't take down asyncio.gather for the rest of
+    the fan-out. A retry (attempt > 1) is cheaper than the first attempt --
+    see call_skill's `reduced` param -- and runs at half the budget, since
+    a failed first try shouldn't cost as much as it did."""
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS_PER_COMPANY + 1):
         try:
@@ -331,13 +458,17 @@ async def profile_company(company_name, firm_name, model, max_budget_usd, timeou
                 append_log(run_dir, f"RETRY portco-profiler {company_name} (attempt {attempt}/{MAX_ATTEMPTS_PER_COMPANY})")
             raw = await call_skill(
                 "portco-profiler", {"company_name": company_name, "parent_firm": firm_name},
-                model, max_budget_usd, timeout, run_dir, semaphore,
+                model, max_budget_usd if attempt == 1 else max_budget_usd / 2, timeout, run_dir, semaphore,
+                budget_tracker,
                 invocation_label=f"portco-profiler-{company_name}"
                 + (f"-attempt{attempt}" if attempt > 1 else ""),
+                reduced=(attempt > 1),
             )
             md, claims = extract_trailing_json_block(raw)
             append_log(run_dir, f"portco-profiler complete for {company_name}")
             return company_name, md, claims
+        except RunBudgetExceededError:
+            raise
         except (SkillCallError, ValueError) as e:
             last_error = e
             append_log(run_dir, f"FAILED portco-profiler {company_name} on attempt {attempt}: {type(e).__name__}: {e}")
@@ -346,13 +477,16 @@ async def profile_company(company_name, firm_name, model, max_budget_usd, timeou
     return company_name, None, None
 
 
-async def estimate_financials(company_name, profile_markdown, model, max_budget_usd, timeout, run_dir, semaphore):
+async def estimate_financials(company_name, profile_markdown, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker):
     """Stage 3 subagent: private-data-approximator for one company, up to
     MAX_ATTEMPTS_PER_COMPANY tries. Deliberately decoupled from stage 2's
     retries: a company whose portco-profiler call succeeded but whose
     private-data-approximator call fails keeps its profile rather than
     losing both, which is what v3 did by trying both skills inside a
-    single try/except per company."""
+    single try/except per company. RunBudgetExceededError propagates
+    rather than being retried, same reasoning as profile_company. A retry
+    runs at half budget with an instruction to settle for the first usable
+    comp instead of comparing options."""
     last_error = None
     for attempt in range(1, MAX_ATTEMPTS_PER_COMPANY + 1):
         try:
@@ -361,13 +495,17 @@ async def estimate_financials(company_name, profile_markdown, model, max_budget_
             raw = await call_skill(
                 "private-data-approximator",
                 {"portco_profile": {"company_name": company_name, "profile_markdown": profile_markdown}},
-                model, max_budget_usd, timeout, run_dir, semaphore,
+                model, max_budget_usd if attempt == 1 else max_budget_usd / 2, timeout, run_dir, semaphore,
+                budget_tracker,
                 invocation_label=f"private-data-approximator-{company_name}"
                 + (f"-attempt{attempt}" if attempt > 1 else ""),
+                reduced=(attempt > 1),
             )
             md, claims = extract_trailing_json_block(raw)
             append_log(run_dir, f"private-data-approximator complete for {company_name}")
             return company_name, md, claims
+        except RunBudgetExceededError:
+            raise
         except (SkillCallError, ValueError) as e:
             last_error = e
             append_log(run_dir, f"FAILED private-data-approximator {company_name} on attempt {attempt}: {type(e).__name__}: {e}")
@@ -401,18 +539,20 @@ def splice_section_7(dossier_with_placeholder, section_7_content):
         )
 
 
-async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_concurrency, max_companies=None):
+async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_concurrency,
+                        max_companies=None, max_run_budget_usd=None):
     append_log(run_dir, f"pipeline start for {firm_name!r}")
     semaphore = asyncio.Semaphore(max_concurrency)
+    budget_tracker = BudgetTracker(max_run_budget_usd)
 
     # --- Stage 1: firm-profiler + portfolio-discoverer, concurrent ---
     firm_task = call_skill(
         "firm-profiler", {"firm_name": firm_name, "research_depth": "standard"},
-        model, max_budget_usd, timeout, run_dir, semaphore,
+        model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     portfolio_task = call_skill(
         "portfolio-discoverer", {"firm_name": firm_name, "scope": "active_only"},
-        model, max_budget_usd, timeout, run_dir, semaphore,
+        model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     # A stage 1 failure is fatal to the whole run (no firm profile means
     # nothing downstream has an anchor), so this gather is allowed to
@@ -450,7 +590,7 @@ async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_c
     # --- Stage 2: portco-profiler, one subagent per company, concurrent,
     # bounded by max_concurrency via the semaphore inside call_skill ---
     profile_results = await asyncio.gather(*[
-        profile_company(name, firm_name, model, max_budget_usd, timeout, run_dir, semaphore)
+        profile_company(name, firm_name, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker)
         for name in company_names
     ])
 
@@ -466,7 +606,7 @@ async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_c
     # company, concurrent. Only companies that survived stage 2 run here;
     # a stage-2 skip has no profile to hand this skill in the first place. ---
     financial_results = await asyncio.gather(*[
-        estimate_financials(name, md, model, max_budget_usd, timeout, run_dir, semaphore)
+        estimate_financials(name, md, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker)
         for name, md in profiled_ok.items()
     ])
 
@@ -493,10 +633,10 @@ async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_c
     ]
 
     confidence_task = call_skill(
-        "confidence-scorer", confidence_input, model, max_budget_usd, timeout, run_dir, semaphore,
+        "confidence-scorer", confidence_input, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     source_task = call_skill(
-        "source-typer", confidence_input, model, max_budget_usd, timeout, run_dir, semaphore,
+        "source-typer", confidence_input, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     confidence_raw, source_raw = await asyncio.gather(confidence_task, source_task)
 
@@ -522,13 +662,13 @@ async def run_pipeline(firm_name, model, max_budget_usd, timeout, run_dir, max_c
         "skipped_companies": skipped_companies,
     }
     dossier_raw = await call_skill(
-        "dossier-assembler", assembler_input, model, max_budget_usd, timeout, run_dir, semaphore,
+        "dossier-assembler", assembler_input, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     append_log(run_dir, "dossier-assembler complete, sections 1-6 plus section 7 placeholder")
 
     # --- Stage 6: audit-pass, sequential ---
     section_7_raw = await call_skill(
-        "audit-pass", {"dossier_markdown": dossier_raw}, model, max_budget_usd, timeout, run_dir, semaphore,
+        "audit-pass", {"dossier_markdown": dossier_raw}, model, max_budget_usd, timeout, run_dir, semaphore, budget_tracker,
     )
     full_dossier_raw = splice_section_7(dossier_raw, section_7_raw)
     append_log(run_dir, "audit-pass complete, section 7 spliced into dossier by code, not by model reproduction")
@@ -543,12 +683,20 @@ def main():
     parser.add_argument("--max-budget-usd", type=float, default=2.0,
                          help="cap PER SKILL CALL (default: 2.0)")
     parser.add_argument("--timeout", type=int, default=600)
-    parser.add_argument("--max-concurrency", type=int, default=4,
-                         help="max simultaneous claude -p subprocesses (default: 4)")
+    parser.add_argument("--max-concurrency", type=int, default=15,
+                         help="max simultaneous claude -p subprocesses (default: 15)")
     parser.add_argument("--max-companies", type=int, default=None,
                          help="limit the run to the first N portfolio companies found "
                               "(default: no limit, use all companies). Good for a smoke "
                               "test of the parallel fan-out before a full run.")
+    parser.add_argument("--max-run-budget-usd", type=float, default=5.0,
+                         help="cap on CUMULATIVE spend across every skill call in the "
+                              "whole run (default: 15.0). Checked once per call, right "
+                              "before that call's subprocess is spawned -- calls already "
+                              "in flight when the cap is crossed are left to finish "
+                              "rather than killed, so actual spend can overshoot by up "
+                              "to --max-concurrency in-flight calls' worth. Pass 0 or "
+                              "a negative number to disable.")
     parser.add_argument("--out", default=None)
     parser.add_argument("--dry-run", action="store_true",
                          help="print the planned call sequence and exit, do not call claude")
@@ -560,6 +708,10 @@ def main():
     if args.dry_run:
         print(f"Would research: {args.firm_name}")
         print(f"Run log would be written to: {run_dir}")
+        if args.max_run_budget_usd > 0:
+            print(f"Cumulative run budget cap: ${args.max_run_budget_usd:.2f}")
+        else:
+            print("Cumulative run budget cap: disabled")
         print("Call sequence:")
         print("  1. firm-profiler + portfolio-discoverer (concurrent)")
         if args.max_companies:
@@ -573,10 +725,12 @@ def main():
         print("  6. audit-pass")
         return
 
+    max_run_budget_usd = args.max_run_budget_usd if args.max_run_budget_usd > 0 else None
+
     try:
         full_dossier, skipped_companies, financial_skipped = asyncio.run(
             run_pipeline(args.firm_name, args.model, args.max_budget_usd, args.timeout,
-                         run_dir, args.max_concurrency, args.max_companies)
+                         run_dir, args.max_concurrency, args.max_companies, max_run_budget_usd)
         )
     except SkillCallError as e:
         sys.exit(str(e))
