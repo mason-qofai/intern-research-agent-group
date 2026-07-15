@@ -1,4 +1,4 @@
-# Palladium Equity Partners — Investment Dossier
+# Palladium Equity Partners Dossier
 
 ---
 
