@@ -1,5 +1,5 @@
 name: audit-pass
-description: after the dossier is completely assembled, read the dossier and produce and audit report that flags inaccuracies or question claims/reasoning steps.
+description: after the dossier is completely assembled, read the dossier and produce an audit report that flags inaccuracies or question claims/reasoning steps.
 
 --
 
