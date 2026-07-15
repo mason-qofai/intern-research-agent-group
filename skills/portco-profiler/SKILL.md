@@ -31,7 +31,7 @@ Every field above carries `confidence` (high/medium/low) and `source_type` (publ
 
 ## Output format (hybrid)
 
-Output is a markdown body (business_description, leadership, notable_events, etc, as normal prose/list sections) followed by a trailing fenced JSON block titled `## Claims`:
+Output is a markdown body (business_description, notable_events, etc, as normal prose/list sections) followed by a trailing fenced JSON block titled `## Claims`:
 
 ```json
 [
